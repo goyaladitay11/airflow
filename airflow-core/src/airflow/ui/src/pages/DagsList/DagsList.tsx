@@ -1,0 +1,473 @@
+/*!
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import { Box, Skeleton, VStack, type SelectValueChangeDetails } from "@chakra-ui/react";
+import type { ColumnDef } from "@tanstack/react-table";
+import { useTranslation } from "react-i18next";
+import { useSearchParams } from "react-router-dom";
+import { useLocalStorage } from "usehooks-ts";
+
+import type {
+  DagRunState,
+  DagSchedulingState,
+  DAGWithLatestDagRunsResponse,
+} from "openapi/requests/types.gen";
+
+import { ActionBar, RouterLink } from "src/system-components";
+
+import { DagsLayout } from "src/layouts/DagsLayout";
+
+import { DeleteDagButton } from "src/components/DagActions/DeleteDagButton";
+import { FavoriteDagButton } from "src/components/DagActions/FavoriteDagButton";
+import DagRunInfo from "src/components/DagRunInfo";
+import { DataTable } from "src/components/DataTable";
+import type { CardDef } from "src/components/DataTable/types";
+import {
+  SelectionHeaderCheckbox,
+  SelectionProvider,
+  SelectionRowCheckbox,
+  useRowSelection,
+} from "src/components/DataTable/useRowSelection";
+import { useTableURLState } from "src/components/DataTable/useTableUrlState";
+import { DrainingBadge } from "src/components/DrainingBadge";
+import { ErrorAlert } from "src/components/ErrorAlert";
+import { NeedsReviewBadge } from "src/components/NeedsReviewBadge";
+import { SearchBar } from "src/components/SearchBar";
+import { TeamName } from "src/components/TeamName";
+import { TogglePause } from "src/components/TogglePause";
+import { TriggerDAGButton } from "src/components/TriggerDag/TriggerDAGButton";
+
+import { DAGS_LIST_DISPLAY_KEY } from "src/constants/localStorage";
+import { SearchParamsKeys, type SearchParamsKeysType } from "src/constants/searchParams";
+import { useAdvancedSearch } from "src/hooks/useAdvancedSearch";
+import { useConfig } from "src/queries/useConfig";
+import { useDagRunStateCounts } from "src/queries/useDagRunStateCounts";
+import { useDags } from "src/queries/useDags";
+import { useDocumentTitle } from "src/utils";
+
+import { DagImportErrors } from "../Dashboard/Stats/DagImportErrors";
+import BulkPauseDrainDagsButton from "./BulkPauseDrainDagsButton";
+import BulkUnpauseDagsButton from "./BulkUnpauseDagsButton";
+import { DagCard } from "./DagCard";
+import { DagRunStateCounts } from "./DagRunStateCounts";
+import { DagTags } from "./DagTags";
+import { DagsFilters } from "./DagsFilters";
+import { Schedule } from "./Schedule";
+import { SortSelect } from "./SortSelect";
+
+const getRowKey = (dag: DAGWithLatestDagRunsResponse) => dag.dag_id;
+
+type GetColumnsParams = {
+  readonly multiTeam: boolean;
+};
+
+type RunStateCountsContext = {
+  readonly countsByDag: Record<string, Record<string, number> | undefined>;
+  readonly isLoading: boolean;
+  readonly stateCountLimit: number | undefined;
+};
+
+const createColumns = (
+  translate: (key: string, options?: Record<string, unknown>) => string,
+  runStateContext: RunStateCountsContext,
+  { multiTeam }: GetColumnsParams,
+): Array<ColumnDef<DAGWithLatestDagRunsResponse>> => [
+  {
+    accessorKey: "select",
+    cell: ({ row }) => <SelectionRowCheckbox colorPalette="brand" rowKey={getRowKey(row.original)} />,
+    enableHiding: false,
+    enableSorting: false,
+    header: () => <SelectionHeaderCheckbox colorPalette="brand" />,
+    meta: {
+      skeletonWidth: 10,
+    },
+  },
+  {
+    accessorKey: "is_paused",
+    cell: ({ row: { original } }) => (
+      <TogglePause
+        dagDisplayName={original.dag_display_name}
+        dagId={original.dag_id}
+        hasUnfinishedRuns={original.has_unfinished_runs}
+        isPaused={original.is_paused}
+        schedulingState={original.scheduling_state}
+      />
+    ),
+    enableSorting: false,
+    header: "",
+    meta: {
+      skeletonWidth: 10,
+    },
+  },
+  {
+    accessorKey: "dag_display_name",
+    cell: ({ row: { original } }) => (
+      <RouterLink fontWeight="bold" to={`/dags/${original.dag_id}`}>
+        {original.dag_display_name}
+      </RouterLink>
+    ),
+    header: () => translate("dagId"),
+  },
+  {
+    accessorKey: "timetable_description",
+    cell: ({ row: { original } }) => (
+      <Schedule
+        assetExpression={original.asset_expression}
+        dagId={original.dag_id}
+        timetableDescription={original.timetable_description}
+        timetablePartitioned={original.timetable_partitioned}
+        timetableSummary={original.timetable_summary}
+      />
+    ),
+    enableSorting: false,
+    header: () => translate("dagDetails.schedule"),
+  },
+  {
+    accessorKey: "next_dagrun",
+    cell: ({ row: { original } }) =>
+      original.is_paused ? undefined : original.scheduling_state === "draining" ? (
+        <DrainingBadge />
+      ) : Boolean(original.next_dagrun_run_after) ? (
+        <DagRunInfo
+          logicalDate={original.next_dagrun_logical_date}
+          runAfter={original.next_dagrun_run_after as string}
+        />
+      ) : undefined,
+    header: () => translate("dagDetails.nextRun"),
+  },
+  {
+    accessorKey: "last_run_run_after",
+    cell: ({ row: { original } }) =>
+      original.latest_dag_runs[0] ? (
+        <RouterLink
+          fontWeight="bold"
+          to={`/dags/${original.dag_id}/runs/${original.latest_dag_runs[0].run_id}`}
+        >
+          <DagRunInfo
+            endDate={original.latest_dag_runs[0].end_date}
+            logicalDate={original.latest_dag_runs[0].logical_date}
+            runAfter={original.latest_dag_runs[0].run_after}
+            startDate={original.latest_dag_runs[0].start_date}
+            state={original.latest_dag_runs[0].state}
+          />
+        </RouterLink>
+      ) : undefined,
+    header: () => translate("dagDetails.latestRun"),
+  },
+  {
+    accessorKey: "run_state_counts",
+    cell: ({ row: { original } }) => (
+      <DagRunStateCounts
+        compact
+        counts={runStateContext.countsByDag[original.dag_id]}
+        dagId={original.dag_id}
+        isLoading={runStateContext.isLoading}
+        stateCountLimit={runStateContext.stateCountLimit}
+      />
+    ),
+    enableSorting: false,
+    header: () => translate("dags:runStateCounts.label"),
+  },
+  {
+    accessorKey: "tags",
+    cell: ({
+      row: {
+        original: { tags },
+      },
+    }) => <DagTags hideIcon tags={tags} />,
+    enableSorting: false,
+    header: () => translate("dagDetails.tags"),
+  },
+  ...(multiTeam
+    ? [
+        {
+          accessorKey: "team_name",
+          cell: ({ row: { original } }: { row: { original: DAGWithLatestDagRunsResponse } }) => (
+            <TeamName teamName={original.team_name} />
+          ),
+          enableSorting: false,
+          header: () => translate("dagDetails.team"),
+        },
+      ]
+    : []),
+  {
+    accessorKey: "pending_actions",
+    cell: ({ row: { original: dag } }) => <NeedsReviewBadge pendingActions={dag.pending_actions} />,
+    enableSorting: false,
+    header: "",
+  },
+  {
+    accessorKey: "trigger",
+    cell: ({ row: { original } }) => (
+      <TriggerDAGButton
+        allowedRunTypes={original.allowed_run_types}
+        dagDisplayName={original.dag_display_name}
+        dagId={original.dag_id}
+        isPaused={original.is_paused}
+      />
+    ),
+    enableSorting: false,
+    header: "",
+  },
+  {
+    accessorKey: "favourite",
+    cell: ({ row: { original } }) => (
+      <FavoriteDagButton dagId={original.dag_id} isFavorite={original.is_favorite} />
+    ),
+    enableHiding: false,
+    enableSorting: false,
+    header: "",
+  },
+  {
+    accessorKey: "delete",
+    cell: ({ row: { original } }) => (
+      <DeleteDagButton dagDisplayName={original.dag_display_name} dagId={original.dag_id} />
+    ),
+    enableSorting: false,
+    header: "",
+  },
+];
+
+const {
+  DAG_RUN_STATE,
+  DAG_RUN_STATE_WITHIN_HOURS,
+  FAVORITE,
+  LAST_DAG_RUN_STATE,
+  NAME_PATTERN,
+  NEEDS_REVIEW,
+  OFFSET,
+  OWNERS,
+  PAUSED,
+  SCHEDULING_STATE,
+  TAGS,
+  TAGS_MATCH_MODE,
+  TEAMS,
+  TIMETABLE_TYPE,
+}: SearchParamsKeysType = SearchParamsKeys;
+
+const createCardDef = (runStateContext: RunStateCountsContext): CardDef<DAGWithLatestDagRunsResponse> => ({
+  card: ({ row }) => (
+    <DagCard
+      dag={row}
+      runStateCounts={runStateContext.countsByDag[row.dag_id]}
+      runStateCountsLoading={runStateContext.isLoading}
+      stateCountLimit={runStateContext.stateCountLimit}
+    />
+  ),
+  meta: {
+    customSkeleton: <Skeleton height="140px" width="100%" />,
+  },
+});
+
+export const DagsList = () => {
+  const { t: translate } = useTranslation();
+
+  useDocumentTitle(translate("common:nav.dags"));
+
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [display, setDisplay] = useLocalStorage<"card" | "table">(DAGS_LIST_DISPLAY_KEY, "card");
+  const dagRunsLimit = display === "card" ? 14 : 1;
+
+  const multiTeamEnabled = Boolean(useConfig("multi_team"));
+
+  const showPaused = searchParams.get(PAUSED);
+  const schedulingState = searchParams.get(SCHEDULING_STATE) as DagSchedulingState | null;
+  const showFavorites = searchParams.get(FAVORITE);
+
+  const lastDagRunState = searchParams.get(LAST_DAG_RUN_STATE) as DagRunState;
+  const dagRunState = searchParams.get(DAG_RUN_STATE) as DagRunState;
+  const withinHoursParam = Number(searchParams.get(DAG_RUN_STATE_WITHIN_HOURS));
+  const withinHours =
+    Number.isFinite(withinHoursParam) && withinHoursParam > 0 ? withinHoursParam : undefined;
+  const selectedTags = searchParams.getAll(TAGS);
+  const selectedMatchMode = searchParams.get(TAGS_MATCH_MODE) === "all" ? "all" : "any";
+  const pendingReviews = searchParams.get(NEEDS_REVIEW);
+  const owners = searchParams.getAll(OWNERS).filter((value) => value !== "");
+  const teams = searchParams.getAll(TEAMS);
+  const timetableType = searchParams.getAll(TIMETABLE_TYPE).filter((value) => value !== "");
+
+  const { setTableURLState, tableURLState } = useTableURLState();
+
+  const { pagination, sorting } = tableURLState;
+  const dagDisplayNamePattern = searchParams.get(NAME_PATTERN) ?? "";
+  const advancedSearch = useAdvancedSearch("dags");
+
+  const orderBy = sorting.length
+    ? sorting.map((sort) => `${sort.desc ? "-" : ""}${sort.id}`)
+    : ["dag_display_name"];
+
+  const handleSearchChange = (value: string) => {
+    setTableURLState({
+      pagination: { ...pagination, pageIndex: 0 },
+      sorting,
+    });
+    if (value) {
+      searchParams.set(NAME_PATTERN, value);
+    } else {
+      searchParams.delete(NAME_PATTERN);
+    }
+    searchParams.delete(OFFSET);
+    setSearchParams(searchParams);
+  };
+
+  // No param means no paused filtering. usePausedDefault seeds the configured default on load,
+  // so an absent param after that is the user having removed the pill to see every Dag.
+  let paused = undefined;
+  let isFavorite = undefined;
+  let pendingHitl = undefined;
+
+  if (showPaused === "true") {
+    paused = true;
+  } else if (showPaused === "false") {
+    paused = false;
+  }
+
+  if (showFavorites === "true") {
+    isFavorite = true;
+  } else if (showFavorites === "false") {
+    isFavorite = false;
+  }
+
+  if (pendingReviews === "true") {
+    pendingHitl = true;
+  } else if (pendingReviews === "false") {
+    pendingHitl = false;
+  }
+
+  const { data, error, isFetching, isLoading } = useDags({
+    advancedSearch: advancedSearch.enabled,
+    dagDisplayNamePattern: Boolean(dagDisplayNamePattern) ? dagDisplayNamePattern : undefined,
+    dagRunsLimit,
+    dagRunState,
+    dagRunStateWithinHours: Boolean(dagRunState) ? withinHours : undefined,
+    isFavorite,
+    lastDagRunState,
+    limit: pagination.pageSize,
+    offset: pagination.pageIndex * pagination.pageSize,
+    orderBy,
+    owners,
+    paused,
+    pendingHitl,
+    schedulingState: schedulingState ?? undefined,
+    tags: selectedTags,
+    tagsMatchMode: selectedMatchMode,
+    teams: teams.length > 0 ? teams : undefined,
+    timetableType: timetableType.length > 0 ? timetableType : undefined,
+  });
+
+  const { data: runStateCountsData, isLoading: runStateCountsLoading } = useDagRunStateCounts({
+    dagIds: data?.dags.map((dag) => dag.dag_id) ?? [],
+    dags: data?.dags,
+  });
+  const runStateContext: RunStateCountsContext = {
+    countsByDag: Object.fromEntries(
+      (runStateCountsData?.dags ?? []).map((entry) => [entry.dag_id, entry.state_counts]),
+    ),
+    isLoading: runStateCountsLoading,
+    stateCountLimit: runStateCountsData?.state_count_limit,
+  };
+
+  const columns = createColumns(translate, runStateContext, { multiTeam: multiTeamEnabled });
+  const cardDef = createCardDef(runStateContext);
+
+  const { allRowsSelected, clearSelections, deselectKeys, handleRowSelect, handleSelectAll, selectedRows } =
+    useRowSelection({
+      data: data?.dags,
+      getKey: getRowKey,
+    });
+  const selectedDags = (data?.dags ?? []).filter((dag) => selectedRows.has(getRowKey(dag)));
+
+  const handleSortChange = ({ value }: SelectValueChangeDetails<Array<string>>) => {
+    setTableURLState({
+      pagination,
+      sorting: value.map((val) => ({
+        desc: val.startsWith("-"),
+        id: val.replace("-", ""),
+      })),
+    });
+  };
+
+  const handleDisplayToggleChange = (nextDisplay: "card" | "table") => {
+    setDisplay(nextDisplay);
+    if (nextDisplay !== "table") {
+      // The card view has no selection affordance, so drop any stale selection made in table view.
+      clearSelections();
+    }
+  };
+
+  const totalEntries = data?.total_entries ?? 0;
+
+  return (
+    <DagsLayout>
+      <Box pb={8}>
+        <SelectionProvider
+          allRowsSelected={allRowsSelected}
+          onRowSelect={handleRowSelect}
+          onSelectAll={handleSelectAll}
+          selectedRows={selectedRows}
+        >
+          <DataTable
+            cardDef={cardDef}
+            columns={columns}
+            data={data?.dags ?? []}
+            displayMode={display}
+            enableMultiSort
+            errorMessage={<ErrorAlert error={error} />}
+            filterActions={
+              <VStack alignItems="flex-start" gap={2} w="100%">
+                <SearchBar
+                  advancedSearch={advancedSearch}
+                  defaultValue={dagDisplayNamePattern}
+                  onChange={handleSearchChange}
+                  placeholder={translate("dags:search.dags")}
+                />
+                <DagsFilters />
+              </VStack>
+            }
+            headingExtra={<DagImportErrors iconOnly />}
+            initialState={tableURLState}
+            isFetching={isFetching}
+            isLoading={isLoading}
+            modelName="common:dag"
+            onDisplayToggleChange={handleDisplayToggleChange}
+            onStateChange={setTableURLState}
+            presentationActions={
+              display === "card" ? (
+                <SortSelect handleSortChange={handleSortChange} orderBy={orderBy[0]} />
+              ) : undefined
+            }
+            showDisplayToggle
+            skeletonCount={display === "card" ? 5 : undefined}
+            total={totalEntries}
+          />
+          <ActionBar.Root closeOnInteractOutside={false} open={display === "table" && selectedRows.size > 0}>
+            <ActionBar.Content>
+              <ActionBar.SelectionTrigger>
+                {selectedRows.size} {translate("selected")}
+              </ActionBar.SelectionTrigger>
+              <ActionBar.Separator />
+              <BulkPauseDrainDagsButton deselectKeys={deselectKeys} selectedDags={selectedDags} />
+              <BulkUnpauseDagsButton deselectKeys={deselectKeys} selectedDags={selectedDags} />
+              <ActionBar.CloseTrigger onClick={clearSelections} />
+            </ActionBar.Content>
+          </ActionBar.Root>
+        </SelectionProvider>
+      </Box>
+    </DagsLayout>
+  );
+};
